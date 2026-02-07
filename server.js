@@ -9,10 +9,10 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 
 dotenv.config();
 
-/* ---------------- BASIC SETUP ---------------- */
+/* ================= BASIC SETUP ================= */
 const app = express();
 
-/* 🔥 CORS (VERCEL → RAILWAY SAFE) */
+/* ================= CORS (VERCEL → RAILWAY SAFE) ================= */
 app.use(
   cors({
     origin: "*",
@@ -22,17 +22,21 @@ app.use(
 );
 app.options("*", cors());
 
-/* ---------------- ENSURE UPLOADS FOLDER ---------------- */
-const UPLOAD_DIR = "uploads";
+/* ================= UPLOAD DIR (RAILWAY SAFE) ================= */
+/*
+  Railway filesystem root kabhi-kabhi read-only hota hai.
+  /tmp hamesha writable hota hai.
+*/
+const UPLOAD_DIR = "/tmp/uploads";
 if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR);
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
-/* ---------------- MULTER (LOW MEMORY SAFE) ---------------- */
+/* ================= MULTER (LOW MEMORY SAFE) ================= */
 const upload = multer({
   dest: UPLOAD_DIR,
   limits: {
-    fileSize: 2 * 1024 * 1024 // 🔥 2MB ONLY (IMPORTANT)
+    fileSize: 2 * 1024 * 1024 // 🔥 2MB MAX (VERY IMPORTANT)
   },
   fileFilter: (req, file, cb) => {
     if (!file.mimetype.startsWith("image/")) {
@@ -42,12 +46,11 @@ const upload = multer({
   }
 });
 
-/* ---------------- GEMINI ---------------- */
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
-/* ---------------- TELEGRAM (PRODUCTION ONLY) ---------------- */
+/* ================= TELEGRAM (OPTIONAL, PROD ONLY) ================= */
 async function sendTelegramMessage(text) {
   if (process.env.NODE_ENV !== "production") return;
+  if (!process.env.TELEGRAM_BOT_TOKEN) return;
+  if (!process.env.TELEGRAM_CHAT_ID) return;
 
   try {
     await fetch(
@@ -61,31 +64,23 @@ async function sendTelegramMessage(text) {
         })
       }
     );
-  } catch (e) {
-    console.error("Telegram message error:", e.message);
+  } catch (err) {
+    console.error("Telegram error:", err.message);
   }
 }
 
-async function sendTelegramPhoto(path, caption) {
-  if (process.env.NODE_ENV !== "production") return;
-
-  try {
-    const form = new FormData();
-    form.append("chat_id", process.env.TELEGRAM_CHAT_ID);
-    form.append("caption", caption);
-    form.append("photo", fs.createReadStream(path));
-
-    await fetch(
-      `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendPhoto`,
-      { method: "POST", body: form }
-    );
-  } catch (e) {
-    console.error("Telegram photo error:", e.message);
-  }
-}
-
-/* ---------------- AI ANALYSIS (CRASH SAFE) ---------------- */
+/* ================= AI ANALYSIS (LAZY INIT – NO BOOT CRASH) ================= */
 async function analyzeImage(imagePath, mimeType, userPrompt) {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY missing");
+  }
+
+  // 🔥 Gemini init YAHAN hota hai, boot pe nahi
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+  const model = genAI.getGenerativeModel({
+    model: "gemini-2.5-flash"
+  });
+
   const buffer = fs.readFileSync(imagePath);
 
   const prompt = `
@@ -94,14 +89,12 @@ ${userPrompt || "Analyze this image"}
 Give the answer in this format:
 1. What is the problem
 2. Possible cause
-3. Immediate next steps
+3. Immediate next steps (step-by-step)
 4. What to avoid
 5. When to seek expert help
-`;
 
-  const model = genAI.getGenerativeModel({
-    model: "gemini-2.5-flash"
-  });
+Keep it simple and practical.
+`;
 
   try {
     const result = await model.generateContent([
@@ -116,12 +109,12 @@ Give the answer in this format:
 
     return result.response.text();
   } catch (err) {
-    console.error("Gemini crashed:", err.message);
-    throw new Error("AI failed");
+    console.error("Gemini error:", err.message);
+    throw new Error("AI analysis failed");
   }
 }
 
-/* ---------------- MAIN API ---------------- */
+/* ================= MAIN API ================= */
 app.post(
   "/analyze",
   upload.fields([
@@ -159,13 +152,10 @@ app.post(
 
       await sendTelegramMessage(
         `🛡️ Scan4Care Request
-📍 ${location}
-📱 ${device}
-📝 ${userPrompt}`
+📍 Location: ${location}
+📱 Device: ${device}
+📝 Prompt: ${userPrompt}`
       );
-
-      await sendTelegramPhoto(problemPath, "🌾 Problem Image");
-      await sendTelegramPhoto(selfiePath, "👤 Auto Selfie");
 
       const aiResponse = await analyzeImage(
         problemPath,
@@ -179,10 +169,10 @@ app.post(
       });
 
     } catch (err) {
-      console.error("Server error:", err);
+      console.error("Server error:", err.message);
       return res.status(500).json({
         success: false,
-        error: "Server error"
+        error: err.message
       });
     } finally {
       // 🔥 ALWAYS CLEAN FILES
@@ -192,13 +182,13 @@ app.post(
   }
 );
 
-/* ---------------- HEALTH CHECK ---------------- */
+/* ================= HEALTH CHECK ================= */
 app.get("/", (req, res) => {
   res.send("Scan4Care backend running 🚀");
 });
 
-/* ---------------- START SERVER ---------------- */
+/* ================= START SERVER ================= */
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`🔥 Backend running on port ${PORT}`);
+  console.log("🔥 Backend running on port", PORT);
 });
